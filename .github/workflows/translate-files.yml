@@ -1,0 +1,148 @@
+name: Markdown Translation
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  get-files:
+    if: github.event.issue.pull_request && github.event.comment.body == '@github /translate'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has_files: ${{ steps.changed-files.outputs.any_changed }}
+      pr_ref: ${{ steps.get-pr.outputs.ref }}
+    steps:
+      - name: Get PR details
+        id: get-pr
+        run: |
+          PR_DATA=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "${{ github.event.issue.pull_request.url }}")
+          echo "ref=$(echo $PR_DATA | jq -r .head.ref)" >> $GITHUB_OUTPUT
+          echo "sha=$(echo $PR_DATA | jq -r .head.sha)" >> $GITHUB_OUTPUT
+          echo "base=$(echo $PR_DATA | jq -r .base.ref)" >> $GITHUB_OUTPUT
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.get-pr.outputs.ref }}
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v47
+        with:
+          base_sha: origin/${{ steps.get-pr.outputs.base }}
+          files: |
+            **.md
+          files_ignore: |
+            **.ja.md
+            **.zh-TW.md
+            **.zh-CN.md
+
+      - name: Set matrix
+        id: set-matrix
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          files=(${{ steps.changed-files.outputs.all_changed_files }})
+          matrix=$(printf '%s\n' "${files[@]}" | jq -R . | jq -s -c .)
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+  translate-and-commit:
+    needs: get-files
+    if: needs.get-files.outputs.has_files == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.get-files.outputs.pr_ref }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Install @google/genai
+        run: npm install @google/genai
+
+      - name: Create translation script
+        run: |
+          cat << 'EOF' > translate.mjs
+          import { GoogleGenAI } from '@google/genai';
+          import { readFileSync, writeFileSync } from 'fs';
+
+          const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+          const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+          const filePath = process.argv[2];
+          const targetLang = process.argv[3];
+          const outputPath = process.argv[4];
+
+          async function main() {
+            try {
+              const content = readFileSync(filePath, 'utf8');
+
+              const prompt = `Translate the following Markdown content to ${targetLang}.
+              Maintain all Markdown formatting, structure, and code blocks.
+
+              Content:
+              ${content}`;
+
+              const response = await ai.models.generateContent({
+                model: 'gemini-3.1-flash-lite-preview',
+                contents: prompt,
+              });
+
+              let translatedText = response.text;
+
+              const cleanText = translatedText.replace(/^```markdown\n?|^```md\n?/, '').replace(/\n?```$/, '');
+
+              writeFileSync(outputPath, cleanText, 'utf8');
+              console.log(`  -> Saved: ${outputPath}`);
+            } catch (err) {
+              console.error(`  -> Error translating ${filePath}:`, err);
+              process.exit(1);
+            }
+          }
+          main();
+          EOF
+
+      - name: Run translations sequentially
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FILES_JSON: ${{ needs.get-files.outputs.matrix }}
+        run: |
+          langs=("Japanese" "Simplified Chinese" "Traditional Chinese")
+          suffixes=("ja" "zh-CN" "zh-TW")
+
+          for file in $(echo "$FILES_JSON" | jq -r '.[]'); do
+            echo "Processing $file..."
+            for i in "${!langs[@]}"; do
+              lang="${langs[$i]}"
+              suffix="${suffixes[$i]}"
+              base="${file%.md}"
+              output_file="${base}.${suffix}.md"
+              echo "  Translating to $lang..."
+              node translate.mjs "$file" "$lang" "$output_file"
+            done
+          done
+
+      - name: Commit and Push
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+
+          git add "**/*.md"
+
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Add translations"
+            git push origin HEAD:${{ needs.get-files.outputs.pr_ref }}
+          fi
